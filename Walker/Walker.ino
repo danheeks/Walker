@@ -16,6 +16,27 @@ static uint16_t rcValue[IBUS_MAXCHANNELS];
 static uint16_t rcValueSafe[IBUS_MAXCHANNELS]; // read by interrupt handler. Data copied here in cli/sei block
 static boolean rxFrameDone;
 static boolean failsafe = 0;
+unsigned long start_time;
+unsigned long prev_time;
+double fast_cycle_speed = 2.0;
+double slow_cycle_speed = 2.0;
+double cycle_fraction = 1.0;
+
+#define NUM_LEG_POSNS 8
+double leg_step = 1.0 / NUM_LEG_POSNS;
+
+double leg_posns[NUM_LEG_POSNS][4] = {
+//  LT,  LS,  RT,  RS
+  {0.0, -1.0, 0.0, -1.0,},
+  {-0.5,  1.0, 0.0, -1.0,},
+  {-1.0, -1.0, 0.0, -1.0,},
+  {-0.6, -1.0, 0.0, -1.0,},
+  {0.0, -1.0, 0.0, -1.0,},
+  {0.0, -1.0, -0.5,  1.0,},
+  {0.0, -1.0, -1.0, -1.0,},
+  {0.0, -1.0, -0.6, -1.0,},
+};
+
 Servo servoLeftThigh;
 Servo servoLeftShin;
 Servo servoRightThigh;
@@ -42,9 +63,11 @@ void loop() {
 
 void setupServos()
 {
-  servoLeftThigh.attach(8);
+  start_time = millis();
+  prev_time = start_time;
+  servoLeftThigh.attach(10);
   servoLeftShin.attach(9);
-  servoRightThigh.attach(10);
+  servoRightThigh.attach(8);
   servoRightShin.attach(11);
 }
 
@@ -75,26 +98,68 @@ void setServos(int servo)
   double throttle = ((double)rcValue[2] - 1000)*0.001; // number from 0.0 to 1.0
   double yaw = ((double)rcValue[3] - 1500)*0.002;; // + is right, - is left,  range from -1.0 to 1.0 
 
+  // hack to defaults for testing with out a transmitter
+  pitch = 0.0;
+  roll = 0.0;
+  yaw = 0.0;
+  throttle = 0.2;  
+
+  unsigned long now = millis();  
+  unsigned long time_since_start = now - start_time;
+  unsigned long dt = now - prev_time;
+  prev_time = now;
+  
+  double cycle_speed = slow_cycle_speed; // default is to go slow to end of cycle
+  cycle_speed = slow_cycle_speed + (fast_cycle_speed - slow_cycle_speed) * throttle;
+  cycle_fraction += (double)dt * cycle_speed * 0.001;
+  
+  // recycle
+  if(cycle_fraction >= 1.0)
+      cycle_fraction -= 1.0;
+
   switch(servo){
     case 0:
-      setServoHeight(false, true, (throttle - 0.5) * 0.5);
+      setServoHeight(false, true, GetLegPosn(servo));
       break;
 
     case 1:
-      setServoHeight(false, false, yaw * 0.25);
+      setServoHeight(false, false, GetLegPosn(servo));
       break;
       
     case 2:
-      setServoHeight(true, false, yaw * 0.25);
+      setServoHeight(true, true, GetLegPosn(servo));
       break;
       
     case 3:
-      setServoHeight(true, false, yaw * 0.25);
+      setServoHeight(true, false, GetLegPosn(servo));
       break;
 
     default:
       break;
   }
+}
+
+double GetLegPosn(int servo)
+{
+  int posn_index = cycle_fraction * NUM_LEG_POSNS;
+  double fraction = 0.0;
+  if(posn_index >= NUM_LEG_POSNS)
+  {
+    posn_index = 0;
+    fraction = (cycle_fraction - 1.0) * NUM_LEG_POSNS;
+  }
+  else
+  {
+    fraction = (cycle_fraction - (leg_step * posn_index)) * NUM_LEG_POSNS;
+  }
+  int next_posn = posn_index + 1;
+  if(next_posn >= NUM_LEG_POSNS)next_posn = 0;
+  return leg_posns[posn_index][servo] + (leg_posns[next_posn][servo] - leg_posns[posn_index][servo]) * fraction;    
+}
+
+double GetHeightFromFraction(double cycle_fraction)
+{
+  return 0.5 * sin(cycle_fraction * 6.2831853);
 }
 
 static uint8_t ibusIndex = 0;
