@@ -5,11 +5,12 @@
 
 #include <string.h>
 #include <Servo.h>
+#include<Wire.h>
 
 #define IBUS_MAXCHANNELS 14
 #define FAILSAFELIMIT 1020    // When all the 6 channels below this value assume failsafe
 #define IBUS_BUFFSIZE 32    // Max iBus packet size (2 byte header, 14 channels x 2 bytes, 2 byte checksum)
-
+#define NUM_LEG_POSNS 8
 
 static uint16_t rcFailsafe[IBUS_MAXCHANNELS] = {  1500, 1500, 950, 1500, 2000, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500 };
 static uint16_t rcValue[IBUS_MAXCHANNELS];
@@ -18,47 +19,78 @@ static boolean rxFrameDone;
 static boolean failsafe = 0;
 unsigned long start_time;
 unsigned long prev_time;
-double fast_cycle_speed = 2.0;
-double slow_cycle_speed = 2.0;
+double fast_cycle_speed = 0.2;
+double slow_cycle_speed = 0.2;
 double cycle_fraction = 1.0;
-
-#define NUM_LEG_POSNS 8
+const int MPU_addr=0x68;  // I2C address of the MPU-6050
+int16_t AcX,AcY,AcZ,Tmp,GyX,GyY,GyZ;
 double leg_step = 1.0 / NUM_LEG_POSNS;
-
-double leg_posns[NUM_LEG_POSNS][4] = {
+double leg_posns[NUM_LEG_POSNS][4] = {  // move all the time
 //  LT,  LS,  RT,  RS
-  {0.0, -1.0, 0.0, -1.0,},
-  {-0.5,  1.0, 0.0, -1.0,},
-  {-1.0, -1.0, 0.0, -1.0,},
-  {-0.6, -1.0, 0.0, -1.0,},
-  {0.0, -1.0, 0.0, -1.0,},
-  {0.0, -1.0, -0.5,  1.0,},
-  {0.0, -1.0, -1.0, -1.0,},
-  {0.0, -1.0, -0.6, -1.0,},
+  { 0.0, 0.0,  0.0, 0.0,}, // contact
+  { 0.0, 0.5, -0.5, 1.5,}, // recoil
+  { 0.0, 0.2, -0.7, 2.0,}, // passing
+  { 0.0, 0.0, -0.7, 1.0,}, // high point
+  { 0.0, 0.0,  0.0, 0.0,}, // contact
+  {-0.5, 1.5,  0.0, 0.5,}, // recoil
+  {-0.7, 2.0,  0.0, 0.2,}, // passing
+  {-0.7, 1.0,  0.0, 0.0,}, // high point
 };
-
+double leg_posns_forward[NUM_LEG_POSNS][4] = {   // move proportional to forward_factor
+//  LT,  LS,   RT,  RS
+  {-1.0, 0.0,  1.0, 0.0,}, // contact
+  {-0.5, 0.0,  0.5, 0.0,}, // recoil
+  { 0.3, 0.0,  0.2, 0.0,}, // passing
+  { 1.0, 0.0, -0.5, 0.0,}, // high point
+  { 1.0, 0.0, -1.0, 0.0,}, // contact
+  { 0.5, 0.0, -0.5, 0.0,}, // recoil
+  { 0.2, 0.0,  0.3, 0.0,}, // passing
+  {-0.5, 0.0,  1.0, 0.0,}, // high point
+};
+double forward_factor = 0.0;
+double GyYIntegrated = 0.0;
 Servo servoLeftThigh;
 Servo servoLeftShin;
 Servo servoRightThigh;
 Servo servoRightShin;
 
-
-// Prototypes
-void setupRx();
-void readRx();
-
-
 void setup() {
   setupRx();
   setupServos();
+  setupGyro();
 }
 
 void loop() {
   for(int i = 0; i<4; i++)
   {
     readRx();  
+    readGyro();
     setServos(i);
   }
+}
+
+void setupGyro()
+{
+  Wire.begin();
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x6B);  // PWR_MGMT_1 register
+  Wire.write(0);     // set to zero (wakes up the MPU-6050)
+  Wire.endTransmission(true);
+}
+
+void readGyro()
+{
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
+  AcX=Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)     
+  AcY=Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+  AcZ=Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+  Tmp=Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
+  GyX=Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
+  GyY=Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
+  GyZ=Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
 }
 
 void setupServos()
@@ -74,19 +106,21 @@ void setupServos()
 void setServoHeight(bool right_not_left, bool thigh_not_shin, double height)
 {
   // sets the servo to a height, 1.0 is total maximum, -1.0 is total minimum
+  // thigh is from -1.0 to 1.0
+  // shin is from 0 to 2.0, so that 0.0 is the standing straight position for both
   if(right_not_left)
   {
     if(thigh_not_shin)
       servoRightThigh.writeMicroseconds(1500 + height * 500);
     else
-      servoRightShin.writeMicroseconds(1500 + height * 500); 
+      servoRightShin.writeMicroseconds(1000 + height * 500); 
   }
   else
   {
     if(thigh_not_shin)
       servoLeftThigh.writeMicroseconds(1500 - height * 500);
     else
-      servoLeftShin.writeMicroseconds(1500 - height * 500); 
+      servoLeftShin.writeMicroseconds(2000 - height * 500); 
   }
 }
 
@@ -115,7 +149,17 @@ void setServos(int servo)
   
   // recycle
   if(cycle_fraction >= 1.0)
+  {
+      // cycle restart
       cycle_fraction -= 1.0;
+
+      // decide on forward_factor for whole of next move
+      forward_factor = 0.0002 * GyY;
+      if(forward_factor > 1.0)
+        forward_factor = 1.0;
+      if(forward_factor < -1.0)
+        forward_factor = -1.0;
+  }
 
   switch(servo){
     case 0:
@@ -154,7 +198,7 @@ double GetLegPosn(int servo)
   }
   int next_posn = posn_index + 1;
   if(next_posn >= NUM_LEG_POSNS)next_posn = 0;
-  return leg_posns[posn_index][servo] + (leg_posns[next_posn][servo] - leg_posns[posn_index][servo]) * fraction;    
+  return leg_posns[posn_index][servo] + (leg_posns[next_posn][servo] - leg_posns[posn_index][servo]) * fraction + forward_factor * (leg_posns_forward[posn_index][servo] + (leg_posns_forward[next_posn][servo] - leg_posns_forward[posn_index][servo]) * fraction);    
 }
 
 double GetHeightFromFraction(double cycle_fraction)
